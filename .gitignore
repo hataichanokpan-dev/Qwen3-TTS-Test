@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Output
+output/
+output_script/
+*.wav
+!ref_best.wav
+!ref_15s.wav
+!ref_full.wav
+
+# Models (downloaded by transformers)
+models/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# OMC state
+.omc/
+
+# Video
+*.mp4
+
+# Temp
+*.tmp
+test_output.wav
