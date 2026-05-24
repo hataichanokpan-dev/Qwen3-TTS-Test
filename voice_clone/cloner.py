@@ -25,7 +25,7 @@ from .text_preprocess import preprocess_thai_text
 
 
 class VoiceCloner:
-    def __init__(self, ref_audio=None, ref_text=None, config=None, preprocess=True):
+    def __init__(self, ref_audio=None, ref_text=None, config=None, preprocess=False):
         self.config = {**DEFAULTS, **(config or {})}
         self.ref_audio = ref_audio
         self.ref_text = ref_text
