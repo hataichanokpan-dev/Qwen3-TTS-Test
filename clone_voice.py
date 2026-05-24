@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (default: 0.9)")
     parser.add_argument("--rp", type=float, default=1.05, help="Repetition penalty (default: 1.05)")
     parser.add_argument("--xvec", action="store_true", help="Use xvec mode instead of ICL (lower quality)")
+    parser.add_argument("--no-preprocess", action="store_true", help="Disable English→Thai text preprocessing")
     args = parser.parse_args()
 
     cloner = VoiceCloner()
@@ -98,13 +99,15 @@ def main():
         ref_audio=ref_audio,
         ref_text=ref_text,
         config=config_overrides if config_overrides else None,
+        preprocess=not args.no_preprocess,
     )
 
     mode = "xvec" if args.xvec else "ICL"
+    pp = "OFF" if args.no_preprocess else "ON"
     print(f"Ref: {ref_audio}")
     print(f"Ref text: {ref_text or '(none - xvec mode)'}")
     print(f"Text: {text[:80]}{'...' if len(text)>80 else ''}")
-    print(f"Mode: {mode}, temp={args.temp}, top_p={args.top_p}")
+    print(f"Mode: {mode}, preprocess: {pp}, temp={args.temp}, top_p={args.top_p}")
 
     # Build prompt once (official recommended)
     if not args.xvec:
