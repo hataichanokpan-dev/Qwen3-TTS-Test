@@ -20,6 +20,7 @@ import os
 import numpy as np
 import soundfile as sf
 import librosa
+from resemblyzer import VoiceEncoder, preprocess_wav
 
 
 class QAResult:
@@ -67,6 +68,7 @@ class VoiceQA:
         self._whisper_model = None
         self._whisper_params = (whisper_model, whisper_device)
         self._squim_model = None
+        self._encoder = None
 
         if ref_audio:
             self.ref_embedding = self._extract_embedding(ref_audio)
@@ -85,44 +87,37 @@ class VoiceQA:
             self._squim_model = SQUIM_SUBJECTIVE.get_model().to(torch.float32)
         return self._squim_model
 
+    def _get_encoder(self):
+        """Lazy-load Resemblyzer voice encoder."""
+        if self._encoder is None:
+            self._encoder = VoiceEncoder()
+        return self._encoder
+
     def _extract_embedding(self, audio_path):
-        """Extract speaker embedding using MFCC + spectral features."""
-        y, sr = librosa.load(audio_path, sr=16000)
-        # MFCCs as lightweight speaker representation
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-        # Spectral centroid
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-        # Spectral bandwidth
-        bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)
-        # Zero crossing rate
-        zcr = librosa.feature.zero_crossing_rate(y)
-        # RMS energy
-        rms = librosa.feature.rms(y=y)
-        return {
-            "mfcc_mean": np.mean(mfcc, axis=1),
-            "mfcc_std": np.std(mfcc, axis=1),
-            "centroid_mean": np.mean(centroid),
-            "bandwidth_mean": np.mean(bandwidth),
-            "zcr_mean": np.mean(zcr),
-            "rms_mean": np.mean(rms),
-        }
+        """Extract speaker embedding using Resemblyzer d-vector."""
+        wav, sr = sf.read(audio_path)
+        if wav.ndim > 1:
+            wav = wav[:, 0]
+        if sr != 16000:
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=16000)
+        wav = preprocess_wav(wav)
+        encoder = self._get_encoder()
+        return encoder.embed_utterance(wav)
 
     def _cosine_sim(self, a, b):
         """Cosine similarity between two vectors."""
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
-    def check_speaker_similarity(self, audio_path, threshold=0.85):
-        """Check if generated voice matches reference speaker."""
+    def check_speaker_similarity(self, audio_path, threshold=0.90):
+        """Check if generated voice matches reference speaker (Resemblyzer d-vector)."""
         if self.ref_embedding is None:
             return QAResult("speaker_similarity", 0, threshold, False, "No reference audio set")
 
         gen_emb = self._extract_embedding(audio_path)
-        ref_mfcc = self.ref_embedding["mfcc_mean"]
-        gen_mfcc = gen_emb["mfcc_mean"]
-        sim = self._cosine_sim(ref_mfcc, gen_mfcc)
+        sim = self._cosine_sim(self.ref_embedding, gen_emb)
 
-        detail = f"centroid_ref={self.ref_embedding['centroid_mean']:.0f}Hz gen={gen_emb['centroid_mean']:.0f}Hz"
-        return QAResult("speaker_similarity", sim, threshold, sim >= threshold, detail)
+        return QAResult("speaker_similarity", sim, threshold, sim >= threshold,
+                        f"resemblyzer_dvec_sim={sim:.4f}")
 
     def check_asr(self, audio_path, expected_text, cer_threshold=0.3):
         """Transcribe output and compare with expected text using CER."""
