@@ -2,9 +2,12 @@
 Thai text preprocessor for TTS.
 Converts English words/abbreviations to Thai phonetic spelling.
 Fixes pronunciation issues when using non-Thai-native TTS models.
+Uses pythainlp for normalization and number conversion.
 """
 
 import re
+from pythainlp.util import normalize as pythainlp_normalize
+from pythainlp.util import num_to_thaiword
 
 # Curated dictionary: English → Thai phonetic spelling
 # Organized by category for maintainability
@@ -64,18 +67,6 @@ TECH_TERMS = {
     "Developer": "ดีเวลอเปอร์",
 }
 
-# Numbers and symbols
-SYMBOLS = {
-    "42%": "สี่สิบสองเปอร์เซ็นต์",
-    "17%": "สิบเจ็ดเปอร์เซ็นต์",
-    "70%": "เจ็ดสิบเปอร์เซ็นต์",
-    "30%": "สามสิบเปอร์เซ็นต์",
-    "40%": "สี่สิบเปอร์เซ็นต์",
-    "56%": "ห้าสิบหกเปอร์เซ็นต์",
-    "2025": "สองพันยี่สิบห้า",
-    "2026": "สองพันยี่สิบหก",
-}
-
 # Punctuation fixes for better TTS pacing
 # Add spaces around Thai punctuation for clearer segmentation
 def fix_punctuation(text):
@@ -86,30 +77,74 @@ def fix_punctuation(text):
     return text.strip()
 
 
+def convert_numbers(text):
+    """Convert numeric digits in text to Thai words using pythainlp.
+
+    Handles integers, decimals, percentages, and comma-separated numbers.
+    """
+    def replace_number(match):
+        num_str = match.group(0)
+        try:
+            # Handle percentages
+            if '%' in num_str:
+                num_str_clean = num_str.replace('%', '').replace(',', '')
+                num = float(num_str_clean)
+                if num == int(num):
+                    return num_to_thaiword(int(num)) + "เปอร์เซ็นต์"
+                # Decimal percentage
+                int_part = int(num)
+                dec_part = num_str_clean.split('.')[1]
+                return num_to_thaiword(int_part) + "จุด" + "".join(
+                    num_to_thaiword(int(d)) for d in dec_part
+                ) + "เปอร์เซ็นต์"
+            # Handle decimals: 3.14 → "สามจุดหนึ่งสี่"
+            if '.' in num_str:
+                parts = num_str.replace(',', '').split('.')
+                int_part = int(parts[0])
+                dec_digits = parts[1]
+                return num_to_thaiword(int_part) + "จุด" + "".join(
+                    num_to_thaiword(int(d)) for d in dec_digits
+                )
+            # Handle integers (with optional commas)
+            num = int(num_str.replace(',', ''))
+            return num_to_thaiword(num)
+        except (ValueError, TypeError):
+            return num_str
+
+    # Match numbers: optional minus, digits (with optional commas), optional decimal, optional %
+    result = re.sub(
+        r'-?\d+(?:,\d{3})*(?:\.\d+)?%?',
+        replace_number,
+        text
+    )
+    return result
+
+
 def preprocess_thai_text(text):
     """Preprocess Thai text for TTS synthesis.
 
-    1. Replace English words with Thai phonetic spelling
-    2. Fix abbreviations
-    3. Normalize punctuation for pacing
+    1. Normalize Thai characters (pythainlp)
+    2. Convert numbers to Thai words (pythainlp)
+    3. Replace English words with Thai phonetic spelling
+    4. Fix abbreviations
+    5. Normalize punctuation for pacing
     """
-    result = text
+    # Step 1: pythainlp normalization (handles irregular chars, repeated markers)
+    result = pythainlp_normalize(text)
 
-    # Apply symbol replacements first (longer matches first)
-    for eng, thai in sorted(SYMBOLS.items(), key=lambda x: -len(x[0])):
-        result = result.replace(eng, thai)
+    # Step 2: Convert numbers to Thai words
+    result = convert_numbers(result)
 
-    # Apply abbreviation replacements
+    # Step 3: Apply abbreviation replacements
     for eng, thai in ABBREVIATIONS.items():
-        # Use word boundary matching to avoid partial replacements
         pattern = r'\b' + re.escape(eng) + r'\b'
         result = re.sub(pattern, thai, result)
 
-    # Apply tech term replacements (longer phrases first)
+    # Step 4: Apply tech term replacements (longer phrases first)
     for eng, thai in sorted(TECH_TERMS.items(), key=lambda x: -len(x[0])):
         result = result.replace(eng, thai)
 
-    # Fix punctuation
+    # Step 5: Fix punctuation
     result = fix_punctuation(result)
 
     return result

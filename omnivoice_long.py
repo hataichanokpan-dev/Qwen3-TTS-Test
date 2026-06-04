@@ -1,20 +1,27 @@
-"""Generate ~500-word Thai narration with OmniVoice + Resemblyzer QA gate.
+"""Generate long-form Thai narration with OmniVoice + Resemblyzer QA gate.
 
-Chunks text into 8-token pieces, generates each with quality gate:
-  generate → measure speaker similarity → if < 0.90, retry (max 3 attempts)
-Then normalizes RMS to match ref and merges with crossfade.
+Chunks text into configurable Thai word counts (default 15), generates each
+with quality gate: generate → Resemblyzer similarity → retry if < 0.90.
+Includes post-chunk breathing pause insertion and equal-power crossfade merge.
 
 Usage:
-    python omnivoice_long.py
+    python omnivoice_long.py                    # default run
+    python omnivoice_long.py --dry-run          # preview chunks without GPU
+    python omnivoice_long.py --chunk-size 10    # custom chunk size
+    python omnivoice_long.py --preprocess       # enable text preprocessing
+    python omnivoice_long.py --text "ทดสอบ"     # custom text
 """
 
 import os
 import sys
 import time
 import gc
+import argparse
 import numpy as np
 import soundfile as sf
 import librosa
+from pythainlp.tokenize import word_tokenize, sent_tokenize
+from pythainlp.util import normalize as pythainlp_normalize
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -28,7 +35,7 @@ REF_AUDIO = os.path.join(BASE_DIR, "ref_best.wav")
 TARGET_SR = 24000
 SIM_THRESHOLD = 0.90
 MAX_RETRIES = 5
-CHUNK_SIZE = 8
+CHUNK_SIZE = 15  # Thai words (~3-5s audio per chunk, benchmark-verified optimal at 92% pass rate)
 
 # ~500-word Thai narration about AI and society
 # Note: avoid greeting-style opening ("สวัสดีครับทุกคน") which causes voice drift
@@ -98,20 +105,134 @@ TEXT = (
 )
 
 
+def thai_word_count(text):
+    """Count actual Thai words using pythainlp word_tokenize (filters whitespace tokens)."""
+    return len([t for t in word_tokenize(text, engine="newmm") if t.strip()])
+
+
+# Thai clause boundaries and transition words that naturally precede a pause
+_PAUSE_AFTER_WORDS = {
+    "แล้ว", "ดังนั้น", "ดังนั้นจึง", "เพราะ", "เพราะว่า",
+    "ถ้า", "หาก", "แต่", "อย่างไรก็ตาม", "ในทางกลับกัน",
+    "เช่น", "ตัวอย่างเช่น", "กล่าวคือ", "กล่าวคือว่า",
+    "โดยเฉพาะ", "ในขณะเดียวกัน", "นอกจากนี้",
+    "เช่นเดียวกัน", "ในทำนองเดียวกัน", "กล่าวโดยสรุป",
+    "สรุปแล้ว", "สรุปได้ว่า", "เป็นที่น่าสังเกตว่า",
+}
+
+# Conjunctions that join clauses — insert comma before them when between clauses
+_PAUSE_BEFORE_WORDS = {
+    "และ", "หรือ", "แต่ว่า", "เมื่อ", "ขณะที่", "ในขณะที่",
+}
+
+
+def insert_breathing_pauses(chunk_text):
+    """Insert comma/period as breathing pause markers in a single chunk.
+
+    Post-chunk operation: called AFTER chunk_text(), BEFORE model.generate().
+    Uses universal punctuation that TTS engines interpret as pauses.
+
+    Rules:
+    - Insert comma after clause boundary words (แล้ว, ดังนั้น, เพราะ, etc.)
+    - Insert comma before conjunctions when they join clauses
+    - Do NOT insert duplicate markers where punctuation already exists
+    - Keep markers minimal — at most 1-2 per chunk
+    """
+    words = word_tokenize(chunk_text, engine="newmm")
+    words = [w for w in words if w.strip()]
+
+    if len(words) <= 4:
+        return chunk_text  # Too short for pause insertion
+
+    result = []
+    pauses_inserted = 0
+    max_pauses = max(1, len(words) // 5)  # ~1 pause per 5 words
+
+    for i, w in enumerate(words):
+        # Skip if previous token is already punctuation
+        if result and result[-1].rstrip() in {",", ".", "ๆ", "ฯ"}:
+            result.append(w)
+            continue
+
+        # Insert comma after clause boundary words
+        if pauses_inserted < max_pauses and w in _PAUSE_AFTER_WORDS:
+            result.append(w)
+            # Check next word isn't punctuation
+            if i + 1 < len(words) and words[i + 1].strip() not in {",", ".", "ๆ", "ฯ", ""}:
+                result.append(", ")
+                pauses_inserted += 1
+            continue
+
+        # Insert comma before conjunctions (when not at start)
+        if pauses_inserted < max_pauses and i > 0 and w in _PAUSE_BEFORE_WORDS:
+            # Only if previous word is content (not another conjunction/punctuation)
+            prev = result[-1].rstrip() if result else ""
+            if prev not in {",", ".", "ๆ", "ฯ", ""} and prev not in _PAUSE_BEFORE_WORDS:
+                result.append(", ")
+                result.append(w)
+                pauses_inserted += 1
+                continue
+
+        result.append(w)
+
+    text = "".join(result)
+    # Clean up any double punctuation
+    text = text.replace(", , ", ", ").replace(", .", ".").replace("..", ".")
+    return text
+
+
 def chunk_text(text, max_words=CHUNK_SIZE):
-    """Split text into chunks by spaces."""
-    words = text.split()
+    """Split Thai text into chunks by sentence boundaries.
+
+    Uses pythainlp sent_tokenize for boundary detection, then groups
+    sentences into chunks up to max_words real Thai words each.
+    Long sentences that exceed max_words are split by word boundaries.
+    """
+    sentences = sent_tokenize(text)
     chunks = []
-    current = []
+    current_sentences = []
+    current_word_count = 0
 
-    for w in words:
-        current.append(w)
-        if len(current) >= max_words:
-            chunks.append(" ".join(current))
-            current = []
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        sent_words = thai_word_count(sent)
 
-    if current:
-        chunks.append(" ".join(current))
+        # If single sentence exceeds max_words, split it by words
+        if sent_words > max_words:
+            # Flush current chunk first
+            if current_sentences:
+                chunks.append("".join(current_sentences))
+                current_sentences = []
+                current_word_count = 0
+            # Split long sentence into sub-chunks by word count
+            words = word_tokenize(sent, engine="newmm")
+            sub = []
+            sub_count = 0
+            for w in words:
+                sub.append(w)
+                sub_count += 1
+                if sub_count >= max_words:
+                    chunks.append("".join(sub))
+                    sub = []
+                    sub_count = 0
+            if sub:
+                # Append remainder to current
+                current_sentences = ["".join(sub)]
+                current_word_count = len(sub)
+            continue
+
+        if current_word_count + sent_words > max_words and current_sentences:
+            chunks.append("".join(current_sentences))
+            current_sentences = [sent]
+            current_word_count = sent_words
+        else:
+            current_sentences.append(sent)
+            current_word_count += sent_words
+
+    if current_sentences:
+        chunks.append("".join(current_sentences))
 
     return chunks
 
@@ -132,8 +253,10 @@ def crossfade_merge(segments, crossfade_s=0.3):
 
     for seg in segments[1:]:
         if cf_samples > 0 and len(merged) >= cf_samples and len(seg) >= cf_samples:
-            fade_out = np.linspace(1.0, 0.0, cf_samples)
-            fade_in = np.linspace(0.0, 1.0, cf_samples)
+            # Equal-power crossfade: cos²(x) + sin²(x) = 1 → constant energy
+            t = np.linspace(0, np.pi / 2, cf_samples)
+            fade_out = np.cos(t)
+            fade_in = np.sin(t)
             overlap = merged[-cf_samples:] * fade_out + seg[:cf_samples] * fade_in
             merged = np.concatenate([merged[:-cf_samples], overlap, seg[cf_samples:]])
         else:
@@ -146,17 +269,78 @@ def cosine_sim(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
 
+def parse_args():
+    """Parse CLI arguments for omnivoice_long.py."""
+    parser = argparse.ArgumentParser(
+        description="Generate long-form Thai narration with OmniVoice + QA gate",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview chunks and pipeline without loading model or generating audio",
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=CHUNK_SIZE,
+        help=f"Max Thai words per chunk (default: {CHUNK_SIZE})",
+    )
+    parser.add_argument(
+        "--crossfade", type=float, default=0.3,
+        help="Crossfade duration in seconds (default: 0.3)",
+    )
+    parser.add_argument(
+        "--preprocess", action="store_true",
+        help="Enable full text preprocessing (English→Thai, numbers→words) before chunking",
+    )
+    parser.add_argument(
+        "--text", type=str, default=None,
+        help="Custom text to generate (overrides built-in TEXT)",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Custom output directory (default: omnivoice_long_output/)",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    # Select text source
+    raw_text = args.text if args.text else TEXT
+
+    # Optional full preprocessing (English→Thai, numbers→words)
+    if args.preprocess:
+        from voice_clone.text_preprocess import preprocess_thai_text
+        raw_text = preprocess_thai_text(raw_text)
+
+    # Normalize text with pythainlp before processing
+    normalized_text = pythainlp_normalize(raw_text)
+
+    word_count = thai_word_count(normalized_text)
+    space_tokens = len(normalized_text.split())
+    print(f"Text: {word_count} Thai words ({space_tokens} space-separated tokens)")
+
+    chunks = chunk_text(normalized_text, max_words=args.chunk_size)
+    print(f"Chunks: {len(chunks)} (max {args.chunk_size} Thai words each)")
+    for i, c in enumerate(chunks):
+        wc = thai_word_count(c)
+        paused = insert_breathing_pauses(c)
+        print(f"  [{i+1}] {wc} words: {c[:60]}...")
+        if paused != c:
+            print(f"       +pauses: {paused[:60]}...")
+    print()
+
+    # Dry-run: print chunks and exit without loading model
+    if args.dry_run:
+        print("[DRY RUN] Preview complete. No audio generated.")
+        return
+
     from omnivoice import OmniVoice
     import torch
     from resemblyzer import VoiceEncoder, preprocess_wav
 
-    word_count = len(TEXT.split())
-    print(f"Text: {word_count} space-separated tokens")
-
-    chunks = chunk_text(TEXT)
-    print(f"Chunks: {len(chunks)} (max {CHUNK_SIZE} tokens each)")
-    print()
+    # Resolve output directory
+    out_dir = args.output_dir if args.output_dir else OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
 
     # Load OmniVoice
     print("Loading OmniVoice...")
@@ -197,14 +381,15 @@ def main():
         best_sim = -1
 
         for attempt in range(1, retries + 1):
-            print(f"  [{chunk_id}/{total}] ({len(chunk_text.split())} tok) attempt {attempt}/{retries}...", end=" ")
+            wc = thai_word_count(chunk_text)
+            print(f"  [{chunk_id}/{total}] ({wc} words) attempt {attempt}/{retries}...", end=" ")
 
             t0 = time.time()
             audio_list = model.generate(
                 text=chunk_text,
                 ref_audio=REF_AUDIO,
                 language_id="th",
-                speed=0.8,
+                speed=0.9,
             )
             audio = audio_list[0]
             if audio.ndim > 1:
@@ -232,17 +417,25 @@ def main():
 
         return best_audio, best_sim, False
 
-    # Process each chunk — if fails after retries, split in half and retry each half
+    # Process each chunk — insert breathing pauses, then generate with quality gate
     for i, chunk in enumerate(chunks):
-        audio, sim, passed = generate_with_gate(chunk, i+1, len(chunks))
+        paused_chunk = insert_breathing_pauses(chunk)
+        audio, sim, passed = generate_with_gate(paused_chunk, i+1, len(chunks))
 
-        if not passed and len(chunk.split()) > 4:
-            # Adaptive split: chunk failed, try splitting in half
-            words = chunk.split()
-            mid = len(words) // 2
-            half1 = " ".join(words[:mid])
-            half2 = " ".join(words[mid:])
-            print(f"  >> Chunk {i+1} failed ({sim:.4f}), splitting into {len(half1.split())}+{len(half2.split())} tokens")
+        if not passed and thai_word_count(chunk) > 4:
+            # Adaptive split: chunk failed, try splitting in half by sentences
+            sents = sent_tokenize(chunk)
+            mid = len(sents) // 2
+            if mid > 0:
+                half1 = " ".join(sents[:mid])
+                half2 = " ".join(sents[mid:])
+            else:
+                # Single sentence, split by words
+                words = word_tokenize(chunk, engine="newmm")
+                mid = len(words) // 2
+                half1 = "".join(words[:mid])
+                half2 = "".join(words[mid:])
+            print(f"  >> Chunk {i+1} failed ({sim:.4f}), splitting into {thai_word_count(half1)}+{thai_word_count(half2)} words")
 
             audio1, sim1, p1 = generate_with_gate(half1, i+1, len(chunks))
             audio2, sim2, p2 = generate_with_gate(half2, i+1, len(chunks))
@@ -264,24 +457,26 @@ def main():
         print(f"  >> Chunk {i+1} final: sim={sim:.4f} [{status}]")
 
         # Save chunk
-        chunk_path = os.path.join(OUTPUT_DIR, f"chunk_{i+1:02d}.wav")
+        chunk_path = os.path.join(out_dir, f"chunk_{i+1:02d}.wav")
         sf.write(chunk_path, audio, TARGET_SR)
 
-    # Merge with crossfade
-    print("\nMerging with crossfade...")
-    merged = crossfade_merge(segments, crossfade_s=0.3)
+    # Merge with equal-power crossfade
+    print("\nMerging with equal-power crossfade...")
+    merged = crossfade_merge(segments, crossfade_s=args.crossfade)
     total_dur = len(merged) / TARGET_SR
-    out_path = os.path.join(OUTPUT_DIR, "full_500words.wav")
+    out_path = os.path.join(out_dir, "full_500words.wav")
     sf.write(out_path, merged, TARGET_SR)
 
     # Summary
     passed = sum(1 for r in results if r["passed"])
     failed = len(results) - passed
     print(f"\n{'='*55}")
+    print(f"Chunk size: {args.chunk_size} words | Crossfade: {args.crossfade}s")
     print(f"Chunks:    {len(chunks)} ({passed} passed, {failed} failed)")
     print(f"Duration:  {total_dur:.1f}s ({total_dur/60:.1f} min)")
     print(f"Gen time:  {total_gen:.1f}s ({total_gen/60:.1f} min)")
     print(f"Avg RTF:   {total_gen/total_dur:.3f}")
+    print(f"Preprocess: {'ON' if args.preprocess else 'OFF'}")
     print(f"Output:    {out_path}")
     print()
     for r in results:

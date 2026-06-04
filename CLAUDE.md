@@ -9,6 +9,7 @@
 | **OmniVoice** (`k2-fsa/OmniVoice`) | TTS engine with voice cloning | Best Thai quality so far, supports `language_id="th"` |
 | **Resemblyzer** | Speaker embedding (d-vector) | Accurate voice similarity measurement — matches human perception |
 | **faster-whisper** (medium) | ASR for QA transcription | Verify pronunciation accuracy (CER) |
+| **pythainlp** | Thai NLP (tokenize, normalize, num-to-words) | Accurate word counting, sentence chunking, text normalization |
 | **ref_best.wav** | Reference voice template | 15s, 24kHz — single speaker for all generation |
 
 ## Engine Status
@@ -23,14 +24,21 @@
 
 ```
 clone_voice.py          CLI — Qwen3-TTS ICL mode (currently broken)
-omnivoice_long.py       OmniVoice long-form generation (chunk + merge)
+omnivoice_long.py       OmniVoice long-form generation (chunk + merge + QA gate)
+  --dry-run             Preview chunks without loading model
+  --chunk-size N        Override default 15 Thai words per chunk
+  --crossfade N          Crossfade duration (default 0.3s, equal-power cos/sin)
+  --preprocess          Enable English→Thai + number conversion
+  --text "..."          Custom text input
+  --output-dir          Custom output directory
+benchmark_chunk_size.py Benchmark script for finding optimal chunk size
 compare_engines.py      A/B test OmniVoice vs real_engine
 real_engine.py          VoiceCloner wrapper → engine_fn interface
-voice_qa.py             QA gate (needs Resemblyzer upgrade — see below)
+voice_qa.py             QA gate (uses Resemblyzer d-vector)
 voice_clone/
   cloner.py             VoiceCloner class (Qwen3-TTS)
   config.py             Model config
-  text_preprocess.py    Thai text preprocessing
+  text_preprocess.py    Thai text preprocessing (English→Thai, numbers→words)
   audio_utils.py        Audio utilities
 ```
 
@@ -47,18 +55,20 @@ audio = audio_list[0]  # numpy array, 24kHz
 
 ### Critical: Chunk Size
 
-**Max 8 space-separated tokens per chunk** (~20s audio). Larger chunks cause:
-- Hallucination (English/Chinese words mixed in)
-- 30s+ silent gaps in output
-- Pronunciation degradation
+**Default 15 Thai words per chunk** (benchmark-verified optimal). Configurable via `--chunk-size`.
+Larger chunks (>15) untested. Smaller chunks (8-12) have LOWER pass rates and slower generation.
+Audio rate: ~3-5s per 15-word chunk (~196 words/min speaking rate).
 
-Chunk sizes tested:
-| Tokens | Audio/chunk | Quality |
-|--------|-------------|---------|
-| 60 | ~100s | ❌ Heavy hallucination, 30s gaps |
-| 35 | ~100s | ❌ Still broken |
-| 15 | ~30-40s | ⚠️ Borderline, some fail |
-| **8** | **~20s** | ✅ **Stable, passes quality gate** |
+Chunk sizes benchmarked (2026-06-04, 5 sentences × 3 retries, Resemblyzer sim ≥ 0.90):
+| Size | Avg Sim | Min Sim | Pass Rate | Avg Gen Time | Audio dur |
+|------|---------|---------|-----------|-------------|-----------|
+| 8 words | 0.874 | 0.767 | 27% (4/15) | 21.0s | ~2.4s |
+| 10 words | 0.894 | 0.838 | 58% (7/12) | 11.3s | ~2.7s |
+| 12 words | 0.900 | 0.861 | 33% (4/12) | 4.5s | ~3.0s |
+| **15 words** | **0.928** | **0.899** | **92% (11/12)** | **4.5s** | **~4.5s** |
+
+Key finding: 15 words is optimal — highest sim, highest pass rate, fastest generation.
+Sentence content matters more than chunk size (some sentences consistently fail across all sizes).
 
 ### Critical: Greeting Avoidance
 
@@ -69,11 +79,11 @@ Chunk sizes tested:
 Every chunk goes through: generate → Resemblyzer similarity → retry if < 0.90 → adaptive split if still failing.
 
 ```
-chunk(8 tok) → generate → sim ≥ 0.90? → PASS → normalize → merge
-                                  ↓ < 0.90
-                              retry (max 5)
-                                  ↓ still fail
-                              split in half → retry each
+chunk(15 tok) → insert_breathing_pauses → generate → sim ≥ 0.90? → PASS → normalize → merge
+                                                        ↓ < 0.90
+                                                    retry (max 5)
+                                                        ↓ still fail
+                                                    split in half → retry each
 ```
 
 - Threshold: 0.90 (Resemblyzer d-vector cosine similarity)
@@ -84,10 +94,17 @@ chunk(8 tok) → generate → sim ≥ 0.90? → PASS → normalize → merge
 
 ### Generation Stats
 
-- Load time: ~5s
-- RTF: 0.67 (with quality gate overhead)
+- Load time: ~5.8s
+- RTF: ~0.67 (with quality gate overhead)
 - Model size: 3,116 MB (2 files: 2,337 MB + 768 MB)
-- 8/8 chunks pass at 8-token size
+- Benchmark (2026-06-04): CHUNK_SIZE=15 → 92% pass rate, avg sim 0.928, avg gen 4.5s/chunk
+
+### Breathing Pauses
+
+`insert_breathing_pauses()` inserts commas at clause boundaries (post-chunk operation).
+**Benchmark finding:** OmniVoice does NOT interpret comma/period as pauses in Thai text.
+Pauses don't appear but also don't hurt quality — feature is kept as harmless.
+Text content affects quality more than punctuation.
 
 ## Resemblyzer: Speaker Similarity
 
